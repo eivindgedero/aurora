@@ -9,7 +9,8 @@
 
   <ItemGroup>
     <PackageReference Include="Discord.Net.Rest" Version="3.20.1" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.11" />
-    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.11" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
   </ItemGroup>
 </Project>

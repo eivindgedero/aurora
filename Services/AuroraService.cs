@@ -1,59 +1,13 @@
-using System.Net.Http.Json;
-using System.Text.Json.Serialization;
-
 namespace aurora.Services;
 
-public record AuroraForecast(
-    int Longitude,
-    int Latitude,
-    int Probability
-);
-
-public record NoaaAuroraResponse
-{
-    [JsonPropertyName("coordinates")]
-    public List<int[]> Coordinates { get; init; } = [];
-}
-
-public record WeatherForecastResponse
-{
-    public WeatherProperties Properties { get; init; } = new();
-}
-
-public record WeatherProperties
-{
-    public List<WeatherTimeSeries> Timeseries { get; init; } = [];
-}
-
-public record WeatherTimeSeries
-{
-    public DateTimeOffset Time { get; init; }
-
-    public WeatherData Data { get; init; } = new();
-}
-
-public record WeatherData
-{
-    public WeatherInstant Instant { get; init; } = new();
-}
-
-public record WeatherInstant
-{
-    public WeatherDetails Details { get; init; } = new();
-}
-
-public record WeatherDetails
-{
-    [JsonPropertyName("cloud_area_fraction")]
-    public double? CloudAreaFraction { get; init; }
-
-    [JsonPropertyName("fog_area_fraction")]
-    public double? FogAreaFraction { get; init; }
-}
+using aurora.Utilities;
+using aurora.Client;
 
 public class AuroraService(
     ILogger<AuroraService> logger,
-    IHttpClientFactory httpClientFactory,
+    AuroraApi auroraApi,
+    WeatherApi weatherApi,
+    MoonApi moonApi,
     DiscordService discordService
 ) : BackgroundService
 {
@@ -64,6 +18,8 @@ public class AuroraService(
         CancellationToken stoppingToken
     )
     {
+        await discordService.InitializeAsync();
+
         using var timer = new PeriodicTimer(
             TimeSpan.FromMinutes(30)
         );
@@ -78,7 +34,7 @@ public class AuroraService(
                 when (!stoppingToken.IsCancellationRequested)
             {
                 logger.LogWarning(
-                    "Request timed out while fetching aurora or weather data"
+                    "Request timed out while fetching aurora, weather or moon data"
                 );
             }
             catch (OperationCanceledException)
@@ -90,7 +46,7 @@ public class AuroraService(
             {
                 logger.LogError(
                     ex,
-                    "Error fetching aurora or weather data"
+                    "Error checking aurora conditions"
                 );
             }
 
@@ -116,58 +72,66 @@ public class AuroraService(
     )
     {
         var bestAuroraLocation =
-            await GetBestAuroraLocationAsync(stoppingToken);
+            await auroraApi.GetBestAuroraLocationAsync(
+                stoppingToken
+            );
 
         if (bestAuroraLocation is null)
         {
             logger.LogWarning(
                 "No relevant aurora coordinates found"
             );
-
             return;
         }
 
-        logger.LogInformation(
-            "Highest aurora probability: {Probability}% at lat {Latitude}, lon {Longitude}",
-            bestAuroraLocation.Probability,
-            bestAuroraLocation.Latitude,
-            bestAuroraLocation.Longitude
-        );
-
-        if (bestAuroraLocation.Probability < MinimumAuroraProbability)
+        if (
+            bestAuroraLocation.Probability
+            < MinimumAuroraProbability
+        )
         {
             logger.LogInformation(
                 "Aurora probability is too low"
             );
-
             return;
         }
 
-        var currentWeather = await GetCurrentWeatherAsync(
-            bestAuroraLocation,
-            stoppingToken
-        );
-
-        if (currentWeather is null)
-        {
-            logger.LogWarning(
-                "No relevant weather forecast found"
+        var weather =
+            await weatherApi.GetCurrentWeatherAsync(
+                stoppingToken
             );
 
-            return;
-        }
+        var moon =
+            await moonApi.GetCurrentMoonDataAsync(
+                stoppingToken
+            );
 
         var cloudCoverage =
-            currentWeather.Data.Instant.Details.CloudAreaFraction;
+            weather.Data.Instant.Details.CloudAreaFraction;
 
         var fogCoverage =
-            currentWeather.Data.Instant.Details.FogAreaFraction;
+            weather.Data.Instant.Details.FogAreaFraction;
+
+        var moonIllumination =
+            AuroraCalculations.MoonPhaseToIllumination(
+                moon.MoonPhase
+            );
+
+        var moonIsUp =
+            AuroraCalculations.IsMoonUp(
+                DateTimeOffset.UtcNow,
+                moon.Moonrise?.Time,
+                moon.Moonset?.Time
+            );
+
+        var effectiveMoonIllumination =
+            moonIsUp ? moonIllumination : 0;
 
         logger.LogInformation(
-            "Weather at {Time}: Clouds {CloudCoverage}%, Fog {fogCoverage}%",
-            currentWeather.Time,
+            "Weather at {Time}: Clouds {CloudCoverage}%, Fog {FogCoverage}%, Moon illumination {MoonIllumination:F1}%",
+            weather.Time,
             cloudCoverage,
-            fogCoverage
+            fogCoverage,
+            moonIllumination
         );
 
         if (cloudCoverage is null)
@@ -179,102 +143,21 @@ public class AuroraService(
             return;
         }
 
-        if (cloudCoverage <= MaximumCloudCoverage)
+        if (cloudCoverage > MaximumCloudCoverage)
         {
-            logger.LogInformation(
-                "Good aurora conditions! Aurora: {AuroraProbability}%, Clouds: {CloudCoverage}%",
-                bestAuroraLocation.Probability,
-                cloudCoverage
-            );
-            var mapsUrl =
-    $"https://www.google.com/maps/search/?api=1&query={bestAuroraLocation.Latitude},{bestAuroraLocation.Longitude}";
-
-            await discordService.SendNotificationAsync(
-                $"Aurora: {bestAuroraLocation.Probability}%, Clouds: {cloudCoverage}%\n" +
-                $"[{bestAuroraLocation.Latitude}, {bestAuroraLocation.Longitude}]({mapsUrl})"
-            );
-
             return;
         }
 
-        logger.LogInformation(
-            "Aurora activity is high, but cloud coverage is too high: {CloudCoverage}%",
-            cloudCoverage
-        );
-    }
-
-    private async Task<AuroraForecast?> GetBestAuroraLocationAsync(
-        CancellationToken stoppingToken
-    )
-    {
-        var client =
-            httpClientFactory.CreateClient("AuroraForecast");
-
-        var forecast =
-            await client.GetFromJsonAsync<NoaaAuroraResponse>(
-                "json/ovation_aurora_latest.json",
-                stoppingToken
-            );
-
-        if (forecast is null)
+        if (effectiveMoonIllumination > 80)
         {
-            logger.LogWarning(
-                "Aurora API returned no data"
-            );
-
-            return null;
+            return;
         }
 
-        var relevantCoordinates = forecast.Coordinates
-            .Where(coordinate => coordinate.Length >= 3)
-            .Select(coordinate => new AuroraForecast(
-                Longitude: coordinate[0],
-                Latitude: coordinate[1],
-                Probability: coordinate[2]
-            ))
-            .Where(point =>
-                point.Longitude is >= 5 and <= 7 &&
-                point.Latitude is >= 58 and <= 59)
-            .ToList();
 
-        return relevantCoordinates
-            .MaxBy(point => point.Probability);
-    }
-
-    private async Task<WeatherTimeSeries?> GetCurrentWeatherAsync(
-        AuroraForecast location,
-        CancellationToken stoppingToken
-    )
-    {
-        var client =
-            httpClientFactory.CreateClient("WeatherForecast");
-
-        var weatherUrl = FormattableString.Invariant(
-            $"compact?lat={location.Latitude}&lon={location.Longitude}"
+        await discordService.SendNotificationAsync(
+            $"Aurora: {bestAuroraLocation.Probability}%, " +
+            $"Clouds: {cloudCoverage}%, " +
+            $"Moon: {effectiveMoonIllumination:F1}%"
         );
-
-        var weather =
-            await client.GetFromJsonAsync<WeatherForecastResponse>(
-                weatherUrl,
-                stoppingToken
-            );
-
-        if (weather is null)
-        {
-            logger.LogWarning(
-                "Weather API returned no data"
-            );
-
-            return null;
-        }
-
-        var now = DateTimeOffset.UtcNow;
-
-        return weather.Properties.Timeseries
-            .Where(item =>
-                item.Data.Instant.Details.CloudAreaFraction is not null)
-            .MinBy(item =>
-                Math.Abs((item.Time - now).Ticks)
-            );
     }
 }
